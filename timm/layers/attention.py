@@ -99,6 +99,14 @@ class Attention(nn.Module):
         self.scale = head_dim ** -0.5
         self.fused_attn = use_fused_attn()
 
+        # -- instrumentation (non-upstream) --
+        # When True, forces the manual (non-fused) attention path below so an
+        # explicit post-softmax [B, num_heads, N, N] tensor exists, and caches it
+        # on `self.attn_map`. Default False: zero behavior/perf change vs upstream.
+        # Toggle via `VisionTransformer.set_attn_capture()` rather than directly.
+        self.store_attn_map: bool = False
+        self.attn_map: Optional[torch.Tensor] = None
+
         self.qkv = nn.Linear(dim, self.attn_dim * 3, bias=qkv_bias, **dd)
         self.q_norm = norm_layer(head_dim, **dd) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(head_dim, **dd) if qk_norm else nn.Identity()
@@ -120,7 +128,7 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        if self.fused_attn and not self.store_attn_map:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -133,6 +141,14 @@ class Attention(nn.Module):
             attn_bias = resolve_self_attn_mask(N, attn, attn_mask, is_causal)
             attn = maybe_add_mask(attn, attn_bias)
             attn = attn.softmax(dim=-1)
+            if self.store_attn_map:
+                # Post-softmax, pre-dropout weights -- dropout would inject
+                # zeros/rescaling noise that isn't part of the "true" attention
+                # distribution. Left attached to the autograd graph (not
+                # detached) so gradient-based methods (e.g. attention rollout
+                # weighted by gradients) remain possible; wrap the forward
+                # pass in torch.no_grad() yourself if you only need the values.
+                self.attn_map = attn
             attn = self.attn_drop(attn)
             x = attn @ v
 

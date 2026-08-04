@@ -1228,6 +1228,105 @@ class VisionTransformer(nn.Module):
             attn_mask=attn_mask,
         )
 
+    # -- instrumentation (non-upstream) --
+    # Opt-in capture of raw post-softmax self-attention maps, for patch/token
+    # importance analysis. See `timm.layers.attention.Attention` for the
+    # underlying mechanism (forces the non-fused attention path on selected
+    # blocks only; zero effect on anything when disabled, which is the default).
+    def set_attn_capture(
+            self,
+            enable: bool = True,
+            indices: Optional[Union[int, List[int]]] = None,
+    ) -> List[int]:
+        """Enable or disable attention map capture on selected transformer blocks.
+
+        Must be called before `forward()`/`forward_features()`; captured maps are
+        then readable via `get_attn_maps()`. Disabling clears any cached maps.
+
+        Args:
+            enable: Turn capture on (True) or off (False).
+            indices: Block indices to (de)instrument, same semantics as
+                `get_intermediate_layers` (None -> all blocks, int -> last n,
+                list -> specific indices, negative indices count from the end).
+
+        Returns:
+            The absolute block indices that were (de)instrumented.
+        """
+        take_indices, _ = feature_take_indices(len(self.blocks), indices)
+        for i in take_indices:
+            attn = self.blocks[i].attn
+            attn.store_attn_map = enable
+            if not enable:
+                attn.attn_map = None
+        return take_indices
+
+    def get_attn_maps(
+            self,
+            indices: Optional[Union[int, List[int]]] = None,
+    ) -> List[torch.Tensor]:
+        """Retrieve attention maps captured by `set_attn_capture` after a forward pass.
+
+        Args:
+            indices: Same semantics as `set_attn_capture`/`get_intermediate_layers`.
+
+        Returns:
+            One [B, num_heads, N, N] tensor per requested block, in block order.
+            N includes any prefix tokens (CLS and/or register tokens, see
+            `self.num_prefix_tokens`) -- slice those rows/cols off if you only
+            want patch-to-patch attention.
+        """
+        take_indices, _ = feature_take_indices(len(self.blocks), indices)
+        maps = []
+        for i in take_indices:
+            attn_map = self.blocks[i].attn.attn_map
+            if attn_map is None:
+                raise RuntimeError(
+                    f"No captured attention map for block {i}. Call "
+                    f"set_attn_capture(True) before forward(), covering this block."
+                )
+            maps.append(attn_map)
+        return maps
+
+    def get_patch_attention_scores(
+            self,
+            indices: Optional[Union[int, List[int]]] = None,
+            reduction: str = "incoming_mean",
+    ) -> List[List[float]]:
+        """Reduce captured attention maps (see `get_attn_maps`) to plain,
+        JSON-serializable per-patch importance scores, for provenance/logging
+        tools that cannot handle raw tensors (e.g. they would otherwise silently
+        drop a torch.Tensor to a non-serializable placeholder). Not intended for
+        further tensor computation -- use `get_attn_maps` directly for that.
+
+        Args:
+            indices: Same semantics as `get_attn_maps`/`set_attn_capture`.
+            reduction: How to collapse [B, num_heads, N, N] to one score per patch
+                (batch and heads are averaged in both cases):
+                'incoming_mean' -- mean attention *received* by each patch from all
+                    other patches. This is the causally relevant signal for any
+                    decoder that consumes the patch tokens' output embeddings
+                    (those embeddings are what actually absorb this attention).
+                'cls' -- the CLS token's outgoing attention row (the classic
+                    visualization). Only causally meaningful if the CLS token's
+                    own output embedding actually reaches the downstream head --
+                    it does not for encoders consumed via forward_intermediates/
+                    features_only, which discard the CLS token before returning.
+
+        Returns:
+            One list of floats (length = number of patch tokens, prefix tokens
+            such as CLS/register tokens excluded) per requested block, in block
+            order.
+        """
+        if reduction not in ("incoming_mean", "cls"):
+            raise ValueError(f"Unknown reduction: {reduction!r}. Use 'incoming_mean' or 'cls'.")
+        npt = self.num_prefix_tokens
+        scores = []
+        for attn_map in self.get_attn_maps(indices):
+            m = attn_map.mean(dim=(0, 1))  # [B, heads, N, N] -> [N, N]
+            per_patch = m[npt:, npt:].mean(dim=0) if reduction == "incoming_mean" else m[0, npt:]
+            scores.append(per_patch.detach().cpu().tolist())
+        return scores
+
     def forward_features(
             self,
             x: torch.Tensor,
